@@ -125,7 +125,7 @@ def harp_operations(config):
         f"longitude<{east}",
         f"{NO2_VARIABLE}_validity>75",
         "derive(surface_wind_speed {time} [m/s])",
-        "surface_wind_speed<5",
+        #"surface_wind_speed<5",
         f"keep(latitude_bounds,longitude_bounds,datetime_start,datetime_length,{NO2_VARIABLE})",
         "derive(datetime_start {time} [days since 2000-01-01])",
         "derive(datetime_stop {time} [days since 2000-01-01])",
