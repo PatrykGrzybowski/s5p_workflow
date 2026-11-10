@@ -1,9 +1,10 @@
 """Airflow 3.x: EODATA -> find NO2 -> HARP -> publish L3.
 
 Connections: eodata_s3, s5p_output_s3.
-HARP runs on the Workflows worker in a temporary micromamba environment.
-Requires worker internet access to micro.mamba.pm and conda-forge, writable
-executable temporary storage, boto3 and requests. No external VM is used.
+HARP runs on the Workflows worker in a temporary environment downloaded from S3.
+Prepare the conda-pack archive once on compatible Linux and upload to S3.
+Workers need access to EODATA, catalogue and output S3, plus writable executable
+temporary storage, boto3 and requests. No package solving occurs on workers.
 XCom carries only product metadata and S3 locations, never credentials or rasters.
 """
 
@@ -101,50 +102,46 @@ def harp_operations(config):
 
 
 def prepare_harp(work_directory):
+    """Load an environment prepared once on Linux using conda-pack."""
     import os
     import platform
     import subprocess
     import tarfile
+    import time
     from pathlib import Path
 
-    import requests
-
     if platform.system() != "Linux" or platform.machine() not in {"x86_64", "AMD64"}:
-        raise RuntimeError("This bootstrap targets Linux x86-64 workers")
+        raise RuntimeError("The prepacked HARP environment targets Linux x86-64")
+    started = time.monotonic()
     work = Path(work_directory)
-    archive_path = work / "micromamba.tar.bz2"
-    print("Downloading micromamba to temporary task storage...", flush=True)
-    with requests.get("https://micro.mamba.pm/api/micromamba/linux-64/latest",
-                      stream=True, timeout=(15, 120)) as response:
-        response.raise_for_status()
-        with archive_path.open("wb") as destination:
-            for chunk in response.iter_content(1024 * 1024):
-                destination.write(chunk)
-    executable = work / "micromamba"
-    with tarfile.open(archive_path, "r:bz2") as archive:
-        member = archive.getmember("bin/micromamba")
-        if not member.isfile():
-            raise ValueError("micromamba archive member is not a regular file")
-        with archive.extractfile(member) as source, executable.open("wb") as destination:
-            import shutil
-            shutil.copyfileobj(source, destination)
-    executable.chmod(0o700)
-    environment = os.environ.copy()
-    environment.pop("PYTHONPATH", None)
-    environment.pop("PYTHONHOME", None)
-    environment["PYTHONNOUSERSITE"] = "1"
-    environment["MAMBA_ROOT_PREFIX"] = str(work / "mamba-root")
+    archive_path = work / "harp-runtime.tar.gz"
     prefix = work / "harp-env"
-    print("Creating isolated HARP environment; the first run can take several minutes...", flush=True)
-    subprocess.run(
-        [str(executable), "create", "-y", "-p", str(prefix),
-         "-c", "conda-forge", "--override-channels", "python=3.12", "harp"],
-        env=environment, check=True, timeout=1800,
-    )
-    runner = [str(executable), "run", "-p", str(prefix)]
+    prefix.mkdir()
+    client, bucket = s3_connection("s5p_output_s3")
+    runtime_key = "environments/harp-runtime-linux64-v1.tar.gz"
+    print(f"Downloading prebuilt HARP environment: s3://{bucket}/{runtime_key}", flush=True)
+    client.download_file(bucket, runtime_key, str(archive_path))
+    print(f"Environment downloaded: {archive_path.stat().st_size / 1024**2:.1f} MiB; extracting...", flush=True)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        archive.extractall(path=prefix, filter="data")
+    python = prefix / "bin/python"
+    unpack = prefix / "bin/conda-unpack"
+    if not python.is_file() or not unpack.is_file():
+        raise ValueError("Expected bin/python and bin/conda-unpack at the archive root. Use conda-pack.")
+    environment = os.environ.copy()
+    for name in ("PYTHONPATH", "PYTHONHOME", "CONDA_PREFIX", "CONDA_DEFAULT_ENV",
+                 "CONDA_PROMPT_MODIFIER", "CONDA_SHLVL"):
+        environment.pop(name, None)
+    environment["PYTHONNOUSERSITE"] = "1"
+    print("Relocating environment with conda-unpack...", flush=True)
+    subprocess.run([str(python), str(unpack)], env=environment, check=True, timeout=300)
+    # Activate the packed environment for native-library activation scripts.
+    runner = ["bash", "-c", 'set -e; source "$1/bin/activate"; shift; exec "$@"',
+              "harp-runtime", str(prefix)]
     subprocess.run(runner + ["harpconvert", "-v"], env=environment, check=True, timeout=60)
+    print(f"HARP environment ready after {time.monotonic()-started:.1f} s", flush=True)
+    archive_path.unlink()
     return runner, environment
-
 
 @dag(
     dag_id="s5p_no2_l2_to_l3",
