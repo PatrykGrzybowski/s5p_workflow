@@ -44,6 +44,38 @@ def s3_connection(connection_id):
     return client, extra.get("bucket_name", default_bucket)
 
 
+def record_progress(stage, **details):
+    """Persist diagnostic progress in S3; this is NOT an Airflow heartbeat."""
+    import hashlib
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    run_id = get_current_context()["run_id"]
+    run_tag = hashlib.sha256(run_id.encode()).hexdigest()[:16]
+    report = {"run_id": run_id, "stage": stage,
+              "updated_at": datetime.now(timezone.utc).isoformat(), "details": details}
+    resources = {}
+    for name in ("memory.current", "memory.max", "memory.events", "cpu.stat"):
+        path = Path("/sys/fs/cgroup") / name
+        try:
+            if path.is_file():
+                resources[name] = path.read_text().strip()
+        except OSError:
+            pass
+    report["worker_resources"] = resources
+    client, bucket = s3_connection("s5p_output_s3")
+    payload = json.dumps(report, indent=2).encode()
+    for key in (f"diagnostics/s5p_no2/{run_tag}/progress.json", "diagnostics/s5p_no2/latest.json"):
+        client.put_object(Bucket=bucket, Key=key, Body=payload, ContentType="application/json")
+    print(f"Progress saved: {stage}; s3://{bucket}/diagnostics/s5p_no2/latest.json", flush=True)
+
+
+def transfer_config():
+    from boto3.s3.transfer import TransferConfig
+    return TransferConfig(max_concurrency=1, use_threads=False, max_io_queue=4)
+
+
 def candidate_keys(product, bucket):
     from urllib.parse import urlsplit
 
@@ -64,7 +96,7 @@ def download_l2(client, bucket, product, destination):
 
     for key in candidate_keys(product, bucket):
         try:
-            client.download_file(bucket, key, str(destination))
+            client.download_file(bucket, key, str(destination), Config=transfer_config())
             print(f"Downloaded s3://{bucket}/{key}", flush=True)
             return key
         except ClientError as error:
@@ -120,8 +152,10 @@ def prepare_harp(work_directory):
     client, bucket = s3_connection("s5p_output_s3")
     runtime_key = "environments/harp-runtime-linux64-v1.tar.gz"
     print(f"Downloading prebuilt HARP environment: s3://{bucket}/{runtime_key}", flush=True)
-    client.download_file(bucket, runtime_key, str(archive_path))
+    record_progress("downloading_environment", runtime_key=runtime_key)
+    client.download_file(bucket, runtime_key, str(archive_path), Config=transfer_config())
     print(f"Environment downloaded: {archive_path.stat().st_size / 1024**2:.1f} MiB; extracting...", flush=True)
+    record_progress("extracting_environment", archive_bytes=archive_path.stat().st_size)
     with tarfile.open(archive_path, "r:gz") as archive:
         archive.extractall(path=prefix, filter="data")
     python = prefix / "bin/python"
@@ -133,7 +167,10 @@ def prepare_harp(work_directory):
                  "CONDA_PROMPT_MODIFIER", "CONDA_SHLVL"):
         environment.pop(name, None)
     environment["PYTHONNOUSERSITE"] = "1"
+    for name in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        environment[name] = "1"
     print("Relocating environment with conda-unpack...", flush=True)
+    record_progress("relocating_environment")
     subprocess.run([str(python), str(unpack)], env=environment, check=True, timeout=300)
     # Activate the packed environment for native-library activation scripts.
     runner = ["bash", "-c", 'set -e; source "$1/bin/activate"; shift; exec "$@"',
@@ -141,6 +178,7 @@ def prepare_harp(work_directory):
     subprocess.run(runner + ["harpconvert", "-v"], env=environment, check=True, timeout=60)
     print(f"HARP environment ready after {time.monotonic()-started:.1f} s", flush=True)
     archive_path.unlink()
+    record_progress("environment_ready", elapsed_seconds=round(time.monotonic()-started, 1))
     return runner, environment
 
 @dag(
@@ -215,6 +253,7 @@ def s5p_no2_l2_to_l3():
         import tempfile
         from pathlib import Path
 
+        record_progress("task3_started")
         source, bucket = s3_connection("eodata_s3")
         output, output_bucket = s3_connection("s5p_output_s3")
         if bucket != selection["source_bucket"]:
@@ -229,7 +268,9 @@ def s5p_no2_l2_to_l3():
             for index, product in enumerate(selection["products"]):
                 l2 = work / f"input_{index}.nc"
                 l3 = work / f"output_{index}.nc"
+                record_progress("downloading_l2", product=product["Name"])
                 source_key = download_l2(source, bucket, product, l2)
+                record_progress("processing_harp", product=product["Name"], l2_bytes=l2.stat().st_size)
                 print(f"HARP processing: {product['Name']}", flush=True)
                 conversion = subprocess.run(
                     runner + ["harpconvert", "-a", operations, "-f", "netcdf", str(l2), str(l3)],
@@ -238,6 +279,7 @@ def s5p_no2_l2_to_l3():
                 if conversion.returncode == 2:
                     raise ValueError("HARP selected no valid observations. Check the product, bbox and filters.")
                 conversion.check_returncode()
+                record_progress("validating_l3", output_bytes=l3.stat().st_size)
                 validation_code = (
                     "import harp,numpy as np,json,sys; "
                     "p=harp.import_product(sys.argv[1]); "
@@ -254,12 +296,15 @@ def s5p_no2_l2_to_l3():
                 print(f"L3 validation: {summary}", flush=True)
                 stem = Path(product["Name"]).stem.replace("_L2__", "_L3__", 1)
                 stage_key = f"_staging/s5p_no2/{run_tag}/{stem}.nc"
-                output.upload_file(str(l3), output_bucket, stage_key)
+                record_progress("uploading_l3", summary=summary, output_bytes=l3.stat().st_size)
+                output.upload_file(str(l3), output_bucket, stage_key, Config=transfer_config())
+                record_progress("l3_staged", stage_key=stage_key)
                 results.append({"stage_key": stage_key, "filename": f"{stem}.nc",
                                 "source_key": source_key, "size": l3.stat().st_size,
                                 "summary": summary})
                 l2.unlink()
                 l3.unlink()
+        record_progress("task3_complete", product_count=len(results))
         return {"results": results, "output_bucket": output_bucket, "run_tag": run_tag,
                 "config": selection["config"], "operations": operations}
 
@@ -267,6 +312,7 @@ def s5p_no2_l2_to_l3():
     def publish_output(processed):
         import json
 
+        record_progress("publishing_output")
         output, bucket = s3_connection("s5p_output_s3")
         if bucket != processed["output_bucket"]:
             raise ValueError("Output bucket changed between tasks")
@@ -293,6 +339,7 @@ def s5p_no2_l2_to_l3():
         print(f"Manifest: s3://{bucket}/{manifest_key}")
         for result in processed["results"]:
             output.delete_object(Bucket=bucket, Key=result["stage_key"])
+        record_progress("finished", manifest=f"s3://{bucket}/{manifest_key}")
         return {"manifest": f"s3://{bucket}/{manifest_key}", "outputs": published}
 
     publish_output(process_harp(find_data(check_eodata())))
