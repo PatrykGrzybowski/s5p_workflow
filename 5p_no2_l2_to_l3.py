@@ -56,7 +56,7 @@ def record_progress(stage, **details):
     report = {"run_id": run_id, "stage": stage,
               "updated_at": datetime.now(timezone.utc).isoformat(), "details": details}
     resources = {}
-    for name in ("memory.current", "memory.max", "memory.events", "cpu.stat"):
+    for name in ("memory.current", "memory.max", "memory.events", "memory.stat", "cpu.stat"):
         path = Path("/sys/fs/cgroup") / name
         try:
             if path.is_file():
@@ -118,6 +118,11 @@ def harp_operations(config):
             or abs(lon_intervals - round(lon_intervals)) > 1e-6):
         raise ValueError("bbox spans must be divisible by grid_degrees")
     return ";".join([
+        f"keep(latitude,longitude,latitude_bounds,longitude_bounds,datetime_start,datetime_length,{NO2_VARIABLE},{NO2_VARIABLE}_validity,surface_zonal_wind_velocity,surface_meridional_wind_velocity)",
+        f"latitude>={south}",
+        f"latitude<{north}",
+        f"longitude>={west}",
+        f"longitude<{east}",
         f"{NO2_VARIABLE}_validity>75",
         "derive(surface_wind_speed {time} [m/s])",
         "surface_wind_speed<5",
@@ -191,7 +196,7 @@ def prepare_harp(work_directory):
     params={
         "publication_date": "2026-11-02",
         "max_products": 1,
-        "bbox": [-180.0, -90.0, 180.0, 90.0],
+        "bbox": [14.0, 49.0, 25.0, 55.0],
         "grid_degrees": 0.1,
     },
     tags=["eo", "sentinel5p", "no2", "harp"],
@@ -227,6 +232,9 @@ def s5p_no2_l2_to_l3():
             "Attributes/OData.CSC.StringAttribute/any(a:a/Name eq 'processingMode' "
             "and a/Value eq 'OFFL')"
         )
+        west, south, east, north = map(float, config["bbox"])
+        polygon = f"{west} {south},{east} {south},{east} {north},{west} {north},{west} {south}"
+        query += f" and OData.CSC.Intersects(area=geography'SRID=4326;POLYGON(({polygon}))')"
         url = CATALOGUE_URL
         params = {"$filter": query, "$top": limit, "$orderby": "PublicationDate asc"}
         products = []
@@ -262,7 +270,27 @@ def s5p_no2_l2_to_l3():
         run_tag = hashlib.sha256(run_id.encode()).hexdigest()[:16]
         operations = harp_operations(selection["config"])
         results = []
-        with tempfile.TemporaryDirectory(prefix="s5p_harp_") as temporary:
+        import os
+        scratch_root = Path(os.environ.get("S5P_WORK_DIR", "/home/airflow/.cache/s5p-work"))
+        scratch_root.mkdir(parents=True, exist_ok=True)
+        scratch_details = {"scratch_root": str(scratch_root)}
+        candidates = []
+        try:
+            resolved = str(scratch_root.resolve())
+            for line in Path("/proc/mounts").read_text().splitlines():
+                fields = line.split()
+                mountpoint = fields[1].replace("\\040", " ")
+                if resolved == mountpoint or resolved.startswith(mountpoint.rstrip("/") + "/"):
+                    candidates.append((len(mountpoint), mountpoint, fields[2]))
+            if candidates:
+                _, mountpoint, filesystem = max(candidates)
+                scratch_details.update(mountpoint=mountpoint, filesystem=filesystem)
+        except OSError:
+            pass
+        record_progress("scratch_ready", **scratch_details)
+        if scratch_details.get("filesystem") in {"tmpfs", "ramfs"}:
+            raise RuntimeError("Scratch is RAM-backed. Set S5P_WORK_DIR to a writable disk-backed location.")
+        with tempfile.TemporaryDirectory(prefix="s5p_harp_", dir=str(scratch_root)) as temporary:
             work = Path(temporary)
             runner, environment = prepare_harp(work)
             for index, product in enumerate(selection["products"]):
